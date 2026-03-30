@@ -1,0 +1,156 @@
+General
+
+Request URL
+https://tms.swetasecurities.com/atsweb/order
+Request Method
+POST
+Status Code
+200 OK
+Remote Address
+203.134.251.22:443
+Referrer Policy
+strict-origin-when-cross-origin
+
+
+Reponse Headers
+
+content-length
+90
+
+content-type
+text/html;charset=ISO-8859-1
+date
+Mon, 30 Mar 2026 08:28:30 GMT
+strict-transport-security
+max-age=31536000; includeSubDomains
+x-content-type-options
+nosniff
+x-frame-options
+SAMEORIGIN
+
+
+Request Headers
+
+:authority
+tms.swetasecurities.com
+:method
+POST
+:path
+/atsweb/order
+:scheme
+https
+accept
+*/*
+accept-encoding
+gzip, deflate, br, zstd
+accept-language
+en-US,en;q=0.9
+cache-control
+no-cache
+content-length
+599
+content-type
+application/x-www-form-urlencoded
+cookie
+username=SK25021; role=OnlineUser; broker_code=SSPL; watchID=83470; is_dvp_enabled=true; max_basket_limit=100; theme=black; JSESSIONID=rM331UdM3xre3afQJwjtShHn4d1D7aWnwriWiyHr.ATRAD
+origin
+https://tms.swetasecurities.com
+pragma
+no-cache
+priority
+u=1, i
+referer
+https://tms.swetasecurities.com/atsweb/home?action=showHome&format=html&reqid=1774855884721
+sec-ch-ua
+"Google Chrome";v="137", "Chromium";v="137", "Not/A)Brand";v="24"
+sec-ch-ua-mobile
+?0
+sec-ch-ua-platform
+"Windows"
+sec-fetch-dest
+empty
+sec-fetch-mode
+cors
+sec-fetch-site
+same-origin
+user-agent
+Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36
+x-requested-with
+XMLHttpRequest
+
+Payload
+
+FormData
+
+action
+submitOrder
+market
+NEPSE
+broker
+SSPL
+format
+json
+clientOrderId
+cseOrderId
+brokerClient
+1
+orderStatus
+Open
+filledQty
+acntid
+712786
+oldPrice
+oldQty
+remainder
+orderplacedate
+marketPrice
+213
+oldDisclose
+txtContraBroker
+110
+txtapprovalReason
+txtsenttoapproval
+no
+txtCompId
+txtOdrStatus
+duplicateOrderId
+z5kCWwTdfw
+product
+web
+clientAcc
+202305173320264 ( SAUGAT KHANAL-27-01-79-01358)
+assetSelect
+1
+actionSelect
+1
+txtSecurity
+HIDCLP
+cmbTypeOfOrder
+1
+spnQuantity
+10
+spnPrice
+214
+cmbTif
+16
+cmbTifDays
+1
+cmbBoard
+1
+hiddenSpnCseFee
+0.02
+txtContraBroker_
+110
+brokerClientVal
+1
+confirm
+1
+
+
+
+Response
+
+
+
+{"code":"0", "description":"javascriptOrderSuccessesFullySubmitted", "data":"success"}
+
