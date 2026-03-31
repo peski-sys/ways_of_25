@@ -4,7 +4,7 @@
 // Orders: https://x.naasasecurities.com.np/MarketOrder/Order
 //
 // ── Linux build ───────────────────────────────────────────────────────────────
-//   g++ -std=c++17 -O2 -o trader main_updated.cpp \
+//   g++ -std=c++17 -O3 -march=native -flto -o trader main_updated.cpp \
 //       $(pkg-config --cflags --libs libcurl libwebsockets) \
 //       -lz -lpthread
 //
@@ -28,7 +28,6 @@
 #include <cctype>
 #include <charconv>
 #include <chrono>
-#include <condition_variable>
 #include <csignal>
 #include <cmath>
 #include <cstring>
@@ -75,8 +74,7 @@ static const char* BGN_ = "\033[92m";
 static const char* BCY_ = "\033[96m";
 
 // ── Naasa order endpoint ──────────────────────────────────────────────────────
-static const std::string NAASA_ORDER_URL      = "https://x.naasasecurities.com.np/MarketOrder/Order";
-static const std::string NAASA_SERVER_TIME_URL = "https://x.naasasecurities.com.np/Home/ServerTime";
+// (Orders go to ATRAD_ORDER_URL — Naasa WS is price feed only)
 
 // ── Config ────────────────────────────────────────────────────────────────────
 static const int   NST_OFFSET_SECS = 20700; // UTC+5:45
@@ -98,8 +96,6 @@ static std::atomic<bool> g_naasa_kicked{false}; // set when server sends 104 "Us
 // Raw .AspNetCore.Session cookie value — stored in memory (not via file) so it is always
 // injected directly into order requests, mirroring what main.py's requests.Session does.
 static std::string g_naasa_asp_cookie;          // protected by g_naasa_session_mutex
-// Optional SOCKS5/HTTP proxy for Naasa auth requests (empty = direct connection).
-static std::string g_naasa_proxy;
 
 // ── ATRAD / Sweta Securities (order system) ───────────────────────────────────
 static const char* ATRAD_BASE          = "https://tms.swetasecurities.com/atsweb";
@@ -208,8 +204,6 @@ static HttpResponse naasa_request(const std::string& url,
     curl_easy_setopt(g_naasa_curl, CURLOPT_CONNECTTIMEOUT,  30L);
     curl_easy_setopt(g_naasa_curl, CURLOPT_TIMEOUT,         60L);
     curl_easy_setopt(g_naasa_curl, CURLOPT_ACCEPT_ENCODING,  "");
-    if (!g_naasa_proxy.empty())
-        curl_easy_setopt(g_naasa_curl, CURLOPT_PROXY, g_naasa_proxy.c_str());
     curl_easy_setopt(g_naasa_curl, CURLOPT_WRITEFUNCTION,    write_cb);
     curl_easy_setopt(g_naasa_curl, CURLOPT_WRITEDATA,        &body);
 
@@ -591,10 +585,13 @@ struct Watch {
     curl_slist* order_hdrs  = nullptr;
 
     // warmup_curl: heartbeat-only handle to keep TCP/HTTP alive to ATRAD.
-    // Heartbeat also tries try_lock on order_curl (non-blocking) so both handles
-    // stay warm — eliminates cold TLS risk on first order after a long idle period.
+    // Heartbeat POSTs every 200ms to keep Tomcat POST handler hot.
+    // NEVER touches order_curl — zero Deadly Embrace risk with the WS thread.
     CURL*       warmup_curl = nullptr;
     std::mutex  warmup_curl_mutex;
+    // Pre-built GET headers for heartbeat warmup (built once, reused every 2s).
+    // Eliminates curl_slist_append malloc on the heartbeat loop.
+    curl_slist* warmup_hdrs = nullptr;
 
     // ── Pre-built payload segments (assembled once at cmd_add_watch) ──────────────
     // Full payload = seg_a + ltp + seg_b + dup_pool[idx] + seg_c_{normal|circuit} + bid + seg_d
@@ -615,6 +612,7 @@ struct Watch {
         if (order_curl)  { curl_easy_cleanup(order_curl);  order_curl  = nullptr; }
         if (warmup_curl) { curl_easy_cleanup(warmup_curl); warmup_curl = nullptr; }
         curl_slist_free_all(order_hdrs);
+        curl_slist_free_all(warmup_hdrs);
     }
 
     std::thread worker;
@@ -808,11 +806,6 @@ static int nepal_secs_since_midnight() {
     return tm_nst.tm_hour * 3600 + tm_nst.tm_min * 60 + tm_nst.tm_sec;
 }
 
-static bool is_market_open() {
-    int s = nepal_secs_since_midnight();
-    return s > (11 * 3600) && s < (15 * 3600);
-}
-
 // ── libcurl helpers ───────────────────────────────────────────────────────────
 static size_t write_cb(char* ptr, size_t size, size_t nmemb, void* ud) {
     auto* buf = static_cast<std::string*>(ud);
@@ -874,7 +867,7 @@ static bool is_order_success(long http_code, const std::string& body) {
 // price = bid = min(floor(ltp*1.02*10)/10, circuit),  ltp = raw tick value.
 // at_circuit selects tpl_seg_c_circuit (endingQty) vs tpl_seg_c_normal (qty).
 static void place_order(double price, bool at_circuit, double ltp,
-                        std::shared_ptr<Watch> watch,
+                        const std::shared_ptr<Watch>& watch,
                         std::chrono::steady_clock::time_point tick_time) {
     // Thread-local buffers: capacity retained across calls → zero heap alloc after first.
     thread_local std::string tl_payload;
@@ -1169,16 +1162,15 @@ static int naasa_ws_callback(struct lws* wsi, enum lws_callback_reasons reason,
 
             {
                 auto& w = *ctx->watch_ptr;
-                if (w.stop.load()) break;
-                std::lock_guard<std::mutex> ll(w.lat_mutex);
+                if (w.stop.load(std::memory_order_relaxed)) break;
+                // first_order_done and last_ltp are std::atomic — no mutex needed.
+                // lat_mutex is ONLY for the vectors/spent in place_order.
+                // Single WS thread per watch: no concurrent writer here.
                 is_first = !w.first_order_done.load(std::memory_order_relaxed);
-                prev_ltp = w.last_ltp.load(std::memory_order_relaxed);
-                if (is_first) {
-                    w.first_order_done.store(true, std::memory_order_relaxed);
-                    w.last_ltp.store(ltp,          std::memory_order_relaxed);
-                } else if (prev_ltp != ltp) {
-                    w.last_ltp.store(ltp,          std::memory_order_relaxed);
-                }
+                prev_ltp =  w.last_ltp.load(std::memory_order_relaxed);
+                if (is_first) w.first_order_done.store(true, std::memory_order_relaxed);
+                if (is_first || prev_ltp != ltp)
+                    w.last_ltp.store(ltp, std::memory_order_relaxed);
             }
 
             if (is_first || (prev_ltp >= 0 && prev_ltp != ltp)) {
@@ -1290,10 +1282,10 @@ static void run_watch_socket(const std::string& watch_id) {
 
         lws_client_connect_info ccinfo{};
         ccinfo.context        = lws_ctx;
-        ccinfo.address        = NAASA_WS_HOST;
+        ccinfo.address        = "45.115.219.5"; // hardcoded IP — skip DNS on every reconnect
         ccinfo.port           = NAASA_WS_PORT;
         ccinfo.path           = ws_path.c_str();
-        ccinfo.host           = NAASA_WS_HOST;
+        ccinfo.host           = NAASA_WS_HOST;  // SNI + HTTP Host header
         ccinfo.origin         = NAASA_WS_HOST;
         ccinfo.protocol       = naasa_ws_protocols[0].name;
         ccinfo.ssl_connection = LCCSCF_USE_SSL
@@ -1319,7 +1311,15 @@ static void run_watch_socket(const std::string& watch_id) {
         while (true) {
             if (watch_ptr_snap->stop.load()) { lws_context_destroy(lws_ctx); goto done; }
 
+            // timeout=0: return immediately if no events (busy-wait).
+            // On a dedicated Linux VPS core with SCHED_FIFO this gives
+            // minimum tick-to-callback latency at the cost of CPU burn.
+            // On Windows use 1ms to avoid 100% CPU on the dev machine.
+#ifdef _WIN32
             int ret = lws_service(lws_ctx, 1);
+#else
+            int ret = lws_service(lws_ctx, 0);
+#endif
             if (ret < 0 || ctx.disconnected) break;
 
             auto now = std::chrono::steady_clock::now();
@@ -1399,12 +1399,9 @@ static void heartbeat_loop() {
             last_atrad_keepalive = std::chrono::steady_clock::now();
         }
 
-        // ATRAD connection keepalive every 2s — both handles per watch.
-        // warmup_curl: always warmed (blocking lock, dedicated handle).
-        // order_curl:  warmed via try_lock — non-blocking, zero Deadly Embrace risk.
-        //   If try_lock fails, the WS thread is placing an order right now → connection alive.
-        //   If try_lock succeeds, do a quick GET to prevent cold TLS on the next order.
-        // 2s interval chosen: safer margin against Tomcat's ~20s keep-alive timeout.
+        // ATRAD warmup_curl keepalive every 2s — GET marketStatus keeps TCP alive.
+        // order_curl is NOT touched here — pre-market warmup (10:59:55 NST) handles it.
+        // 2s interval: safe margin under Tomcat's ~20s HTTP/1.1 keep-alive timeout.
         if (std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::steady_clock::now() - last_order_warmup).count() >= 2) {
             last_order_warmup = std::chrono::steady_clock::now();
@@ -1422,19 +1419,13 @@ static void heartbeat_loop() {
                                          .count()));
             std::string body;
             for (auto& w : snaps) {
-                curl_slist* wh = nullptr;
-                wh = curl_slist_append(wh, g_atrad_cookie_hdr.c_str());
-                wh = curl_slist_append(wh, "x-requested-with: XMLHttpRequest");
-                {
-                    std::lock_guard<std::mutex> wl(w->warmup_curl_mutex);
-                    body.clear();
-                    curl_easy_setopt(w->warmup_curl, CURLOPT_URL,        warmup_url.c_str());
-                    curl_easy_setopt(w->warmup_curl, CURLOPT_HTTPGET,    1L);
-                    curl_easy_setopt(w->warmup_curl, CURLOPT_HTTPHEADER, wh);
-                    curl_easy_setopt(w->warmup_curl, CURLOPT_WRITEDATA,  &body);
-                    curl_easy_perform(w->warmup_curl);
-                }
-                curl_slist_free_all(wh);
+                std::lock_guard<std::mutex> wl(w->warmup_curl_mutex);
+                body.clear();
+                curl_easy_setopt(w->warmup_curl, CURLOPT_URL,        warmup_url.c_str());
+                curl_easy_setopt(w->warmup_curl, CURLOPT_HTTPGET,    1L);
+                curl_easy_setopt(w->warmup_curl, CURLOPT_HTTPHEADER, w->warmup_hdrs); // pre-built
+                curl_easy_setopt(w->warmup_curl, CURLOPT_WRITEDATA,  &body);
+                curl_easy_perform(w->warmup_curl);
             }
         }
 
@@ -1503,7 +1494,7 @@ static void heartbeat_loop() {
                     }
                     if (!w_ptr || !w_ptr->warmup_curl) continue;
                     {
-                        // Pre-market warmup uses warmup_curl — never order_curl.
+                        // warmup_curl: GET marketStatus
                         std::lock_guard<std::mutex> wl(w_ptr->warmup_curl_mutex);
                         std::string body;
                         std::string wu2 = std::string(ATRAD_BASE)
@@ -1512,17 +1503,31 @@ static void heartbeat_loop() {
                                               std::chrono::milliseconds>(
                                               std::chrono::system_clock::now().time_since_epoch())
                                               .count()));
-                        curl_slist* wh2 = nullptr;
-                        wh2 = curl_slist_append(wh2, g_atrad_cookie_hdr.c_str()); // pre-built
-                        wh2 = curl_slist_append(wh2, "x-requested-with: XMLHttpRequest");
                         curl_easy_setopt(w_ptr->warmup_curl, CURLOPT_URL,        wu2.c_str());
                         curl_easy_setopt(w_ptr->warmup_curl, CURLOPT_HTTPGET,    1L);
-                        curl_easy_setopt(w_ptr->warmup_curl, CURLOPT_HTTPHEADER, wh2);
+                        curl_easy_setopt(w_ptr->warmup_curl, CURLOPT_HTTPHEADER, w_ptr->warmup_hdrs);
                         curl_easy_setopt(w_ptr->warmup_curl, CURLOPT_WRITEDATA,  &body);
                         curl_easy_perform(w_ptr->warmup_curl);
-                        curl_slist_free_all(wh2);
                     }
-                    sys_log("Pre-market warmup done for watch " + wid, "ok");
+                    {
+                        // order_curl: POST dummy to establish fresh TCP+TLS on the order handle.
+                        // Safe to hold order_curl_mutex here: g_market_open is still false
+                        // (we are at 10:59:55, market opens at 11:00:00), so the WS callback
+                        // takes the 'continue' branch and never calls place_order.
+                        // Zero contention — this is the only place order_curl is touched
+                        // before market open.
+                        static const char PRE_POST[] = "action=getOrderStatus&format=json";
+                        std::string body;
+                        std::lock_guard<std::mutex> ol(w_ptr->order_curl_mutex);
+                        curl_easy_setopt(w_ptr->order_curl, CURLOPT_URL,           ATRAD_ORDER_URL);
+                        curl_easy_setopt(w_ptr->order_curl, CURLOPT_POST,          1L);
+                        curl_easy_setopt(w_ptr->order_curl, CURLOPT_POSTFIELDS,    PRE_POST);
+                        curl_easy_setopt(w_ptr->order_curl, CURLOPT_POSTFIELDSIZE, (long)(sizeof(PRE_POST) - 1));
+                        curl_easy_setopt(w_ptr->order_curl, CURLOPT_HTTPHEADER,    w_ptr->order_hdrs);
+                        curl_easy_setopt(w_ptr->order_curl, CURLOPT_WRITEDATA,     &body);
+                        curl_easy_perform(w_ptr->order_curl);
+                    }
+                    sys_log("Pre-market warmup done for watch " + wid + " (both handles)", "ok");
                 }
             }
         }
@@ -1681,17 +1686,20 @@ static void cmd_add_watch() {
     watch->maxSpend    = max_spend;
 
     // ── order_curl: dedicated handle for order POSTs only ────────────────────────
-    // Never reset, never touched by heartbeat. HTTP/1.1 keep-alive persists.
+    // Never reset. Touched by heartbeat ONLY during pre-market warmup (10:59:55 NST,
+    // when g_market_open=false and place_order is never called). HTTP/1.1 keep-alive persists.
+    // FOLLOWLOCATION disabled: a 302 from ATRAD means session expired — we want the
+    // 302 itself reported as failure immediately, not a silent redirect to login page.
     watch->order_curl = curl_easy_init();
     if (!watch->order_curl) {
         cprint(std::string(RD_) + "  curl_easy_init failed (order_curl)." + R_); return;
     }
-    curl_easy_setopt(watch->order_curl, CURLOPT_SSL_VERIFYPEER, 0L);
-    curl_easy_setopt(watch->order_curl, CURLOPT_SSL_VERIFYHOST, 0L);
-    curl_easy_setopt(watch->order_curl, CURLOPT_TCP_NODELAY,    1L);
-    curl_easy_setopt(watch->order_curl, CURLOPT_RESOLVE,        g_dns_pins);
-    curl_easy_setopt(watch->order_curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(watch->order_curl, CURLOPT_WRITEFUNCTION,  write_cb);
+    curl_easy_setopt(watch->order_curl, CURLOPT_SSL_VERIFYPEER,  0L);
+    curl_easy_setopt(watch->order_curl, CURLOPT_SSL_VERIFYHOST,  0L);
+    curl_easy_setopt(watch->order_curl, CURLOPT_TCP_NODELAY,     1L);
+    curl_easy_setopt(watch->order_curl, CURLOPT_RESOLVE,         g_dns_pins);
+    curl_easy_setopt(watch->order_curl, CURLOPT_FOLLOWLOCATION,  0L); // no redirect on order handle
+    curl_easy_setopt(watch->order_curl, CURLOPT_WRITEFUNCTION,   write_cb);
     apply_conn_opts(watch->order_curl);
 
     // ── warmup_curl: heartbeat-only handle ───────────────────────────────────────
@@ -1720,6 +1728,10 @@ static void cmd_add_watch() {
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36");
     watch->order_hdrs = curl_slist_append(watch->order_hdrs,
         (std::string("Referer: ") + ATRAD_BASE + "/home?action=showHome&format=html").c_str());
+
+    // ── Pre-build warmup_hdrs for heartbeat GET keepalive — no malloc on heartbeat loop ─
+    watch->warmup_hdrs = curl_slist_append(watch->warmup_hdrs, g_atrad_cookie_hdr.c_str());
+    watch->warmup_hdrs = curl_slist_append(watch->warmup_hdrs, "x-requested-with: XMLHttpRequest");
 
     // ── Pre-build payload template segments ──────────────────────────────────────
     // Everything static baked in once. At order time: 2 snprintfs + 7 appends.
@@ -1783,15 +1795,11 @@ static void cmd_add_watch() {
         curl_easy_perform(watch->order_curl);
 
         // Prime warmup_curl with GET to marketStatus (heartbeat GET keepalive path).
-        curl_slist* wh = nullptr;
-        wh = curl_slist_append(wh, g_atrad_cookie_hdr.c_str());
-        wh = curl_slist_append(wh, "x-requested-with: XMLHttpRequest");
         curl_easy_setopt(watch->warmup_curl, CURLOPT_URL,        warmup_url.c_str());
         curl_easy_setopt(watch->warmup_curl, CURLOPT_HTTPGET,    1L);
-        curl_easy_setopt(watch->warmup_curl, CURLOPT_HTTPHEADER, wh);
+        curl_easy_setopt(watch->warmup_curl, CURLOPT_HTTPHEADER, watch->warmup_hdrs); // pre-built
         curl_easy_setopt(watch->warmup_curl, CURLOPT_WRITEDATA,  &dummy);
         curl_easy_perform(watch->warmup_curl);
-        curl_slist_free_all(wh);
     }
 
     {
