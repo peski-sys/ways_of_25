@@ -25,12 +25,15 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
 #include <cmath>
 #include <cstring>
 #include <ctime>
+#include <string_view>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -75,10 +78,6 @@ static const char* BCY_ = "\033[96m";
 static const std::string NAASA_ORDER_URL      = "https://x.naasasecurities.com.np/MarketOrder/Order";
 static const std::string NAASA_SERVER_TIME_URL = "https://x.naasasecurities.com.np/Home/ServerTime";
 
-// Pre-built Naasa order headers — static, no rotating tokens (unlike TMS).
-// Built once in main() and copied into each watch's order_hdrs at add time.
-static curl_slist* g_naasa_order_hdrs = nullptr;
-
 // ── Config ────────────────────────────────────────────────────────────────────
 static const int   NST_OFFSET_SECS = 20700; // UTC+5:45
 
@@ -110,11 +109,16 @@ static CURL*       g_atrad_curl        = nullptr;
 static std::mutex  g_atrad_mutex;
 // Full cookie string injected into order requests: "JSESSIONID=xxx; username=yyy; ..."
 // Set once at login, read-only afterwards (no lock needed for order fast path).
-static std::string g_atrad_cookie_str;
-static std::string g_atrad_username;   // login ID (for heartbeat checkUserSession)
-static std::string g_atrad_acntid;     // clientacntid from getBOIDUserDetails
-static std::string g_atrad_client_acc; // "clientCode ( lastName-nic)"
-static std::string g_atrad_broker;     // brokerId (e.g. "SSPL")
+static std::string g_atrad_cookie_str; // raw cookie string: "JSESSIONID=x; username=y; ..."
+static std::string g_atrad_cookie_hdr; // pre-built header: "Cookie: JSESSIONID=x; ..."
+static std::string g_atrad_username;       // login ID (for heartbeat checkUserSession)
+static std::string g_atrad_acntid;         // clientacntid from getBOIDUserDetails
+static std::string g_atrad_client_acc;     // "clientCode ( lastName-nic)"
+static std::string g_atrad_broker;         // brokerId (e.g. "SSPL")
+// URL-encoded forms pre-computed at login — reused on every order (zero url_encode() on hot path).
+static std::string g_atrad_broker_enc;
+static std::string g_atrad_acntid_enc;
+static std::string g_atrad_client_acc_enc;
 
 // Stored only when auto-login mode is used — enables heartbeat to re-login
 // automatically when the Naasa session expires.
@@ -319,6 +323,13 @@ static void naasa_do_login(const std::string& email, const std::string& password
     if (session_cookie.empty())
         throw std::runtime_error("Naasa: login failed — .AspNetCore.Session cookie not set");
 
+    // Update in-memory cookie immediately — heartbeat auto re-login calls this
+    // function directly, bypassing do_login_flow(), so we must refresh here.
+    {
+        std::lock_guard<std::mutex> lk(g_naasa_session_mutex);
+        g_naasa_asp_cookie = session_cookie;
+    }
+
     sys_log("Naasa: fetching WS session number...", "sys");
     auto r2 = naasa_request(NAASA_VALIDATE_URL, "POST_JSON_EMPTY");
     if (!parse_and_store_session_no(r2.body))
@@ -345,16 +356,6 @@ static std::string fix_atrad_json(std::string s) {
     return s;
 }
 
-// 10-character random alphanumeric duplicateOrderId (client-side idempotency key).
-static std::string gen_atrad_dup_id() {
-    static const char CHARS[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    thread_local std::mt19937 gen(std::random_device{}());
-    std::uniform_int_distribution<int> dist(0, 61);
-    std::string s(10, ' ');
-    for (char& c : s) c = CHARS[dist(gen)];
-    return s;
-}
 
 // Build the full Cookie header value from g_atrad_curl's in-memory jar.
 // Caller must hold g_atrad_mutex.
@@ -389,6 +390,7 @@ static HttpResponse atrad_do_request(const std::string& url,
     curl_easy_setopt(g_atrad_curl, CURLOPT_COOKIEFILE,      "");  // enable cookie engine
     curl_easy_setopt(g_atrad_curl, CURLOPT_FOLLOWLOCATION,  1L);
     curl_easy_setopt(g_atrad_curl, CURLOPT_TCP_NODELAY,     1L);
+    curl_easy_setopt(g_atrad_curl, CURLOPT_RESOLVE,         g_dns_pins); // re-apply after reset
     curl_easy_setopt(g_atrad_curl, CURLOPT_CONNECTTIMEOUT,  30L);
     curl_easy_setopt(g_atrad_curl, CURLOPT_TIMEOUT,         60L);
     curl_easy_setopt(g_atrad_curl, CURLOPT_ACCEPT_ENCODING, "");
@@ -498,8 +500,13 @@ static void atrad_login(const std::string& username, const std::string& password
     }
 
     // Step 5: Build and store full cookie string from jar
-    g_atrad_cookie_str = build_atrad_cookie_from_jar();
-    g_atrad_username   = username;
+    g_atrad_cookie_str    = build_atrad_cookie_from_jar();
+    g_atrad_cookie_hdr    = "Cookie: " + g_atrad_cookie_str; // pre-built, reused in order_hdrs
+    g_atrad_username      = username;
+    // Pre-encode fields that never change — eliminates url_encode() calls on order hot path.
+    g_atrad_broker_enc      = url_encode(g_atrad_broker);
+    g_atrad_acntid_enc      = url_encode(g_atrad_acntid);
+    g_atrad_client_acc_enc  = url_encode(g_atrad_client_acc);
 
     sys_log("ATRAD: login OK — acntid=" + g_atrad_acntid
             + "  broker=" + g_atrad_broker
@@ -507,17 +514,11 @@ static void atrad_login(const std::string& username, const std::string& password
 }
 
 // Ping ATRAD checkUserSession. Returns true if session is alive.
-// Takes g_atrad_mutex twice: once to snapshot cookie, once for curl operation.
 static bool atrad_check_session() {
-    std::string ck_snap, uname;
-    {
-        std::lock_guard<std::mutex> lk(g_atrad_mutex);
-        ck_snap = g_atrad_cookie_str;
-        uname   = g_atrad_username;
-    }
-    if (ck_snap.empty() || uname.empty()) return false;
-
     std::lock_guard<std::mutex> lk(g_atrad_mutex);
+    const std::string& ck_snap = g_atrad_cookie_str;
+    const std::string& uname   = g_atrad_username;
+    if (ck_snap.empty() || uname.empty()) return false;
     long ts = (long)(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count());
     std::string url = std::string(ATRAD_BASE)
@@ -533,21 +534,23 @@ static bool atrad_check_session() {
     curl_easy_setopt(g_atrad_curl, CURLOPT_SSL_VERIFYPEER,  0L);
     curl_easy_setopt(g_atrad_curl, CURLOPT_SSL_VERIFYHOST,  0L);
     curl_easy_setopt(g_atrad_curl, CURLOPT_FOLLOWLOCATION,  1L);
+    curl_easy_setopt(g_atrad_curl, CURLOPT_RESOLVE,         g_dns_pins); // re-apply after reset
     curl_easy_setopt(g_atrad_curl, CURLOPT_TIMEOUT,         10L);
     curl_easy_setopt(g_atrad_curl, CURLOPT_WRITEFUNCTION,   write_cb);
     curl_easy_setopt(g_atrad_curl, CURLOPT_WRITEDATA,       &body);
 
-    std::string cookie_hdr = "Cookie: " + ck_snap;
+    // g_atrad_cookie_hdr is "Cookie: <full cookie string>" — pre-built at login, no heap alloc.
     curl_slist* hdrs = nullptr;
-    hdrs = curl_slist_append(hdrs, cookie_hdr.c_str());
+    hdrs = curl_slist_append(hdrs, g_atrad_cookie_hdr.c_str());
     hdrs = curl_slist_append(hdrs, "x-requested-with: XMLHttpRequest");
     curl_easy_setopt(g_atrad_curl, CURLOPT_HTTPHEADER, hdrs);
     curl_easy_perform(g_atrad_curl);
     curl_slist_free_all(hdrs);
 
     // Response: {"code":"0","data":{'validation':[true]}}
-    return (body.find("\"code\":\"0\"") != std::string::npos ||
-            body.find("'validation'") != std::string::npos);
+    // Must check for [true] explicitly — 'validation' alone matches [false] too.
+    return body.find("[true]")        != std::string::npos
+        || body.find("\"code\":\"0\"") != std::string::npos;
 }
 
 // ── Watch ─────────────────────────────────────────────────────────────────────
@@ -579,17 +582,38 @@ struct Watch {
     std::vector<int64_t> tick_to_order_us;
     std::vector<int64_t> api_rtt_us;
 
-    // dedicated curl handle for order POSTs — no contention with other watches
+    // order_curl: ONLY touched by the WS thread (place_order) and cmd_fire.
+    // NEVER touched by heartbeat — that uses warmup_curl instead (no Deadly Embrace).
     CURL*       order_curl  = nullptr;
     std::mutex  order_curl_mutex;
-    // Reserved — headers are built per-request in place_order() / cmd_fire().
+    // Pre-built header list (built once at cmd_add_watch, reused every order).
+    // Includes Cookie, Content-Type, x-requested-with, User-Agent, Referer.
     curl_slist* order_hdrs  = nullptr;
 
+    // warmup_curl: heartbeat-only handle to keep TCP/HTTP alive to ATRAD.
+    // Heartbeat also tries try_lock on order_curl (non-blocking) so both handles
+    // stay warm — eliminates cold TLS risk on first order after a long idle period.
+    CURL*       warmup_curl = nullptr;
+    std::mutex  warmup_curl_mutex;
+
+    // ── Pre-built payload segments (assembled once at cmd_add_watch) ──────────────
+    // Full payload = seg_a + ltp + seg_b + dup_pool[idx] + seg_c_{normal|circuit} + bid + seg_d
+    // At order time only 3 small numeric values are appended — zero heap, zero construction.
+    std::string tpl_seg_a;          // static prefix ending with "&marketPrice="
+    std::string tpl_seg_b;          // middle section ending with "&duplicateOrderId="
+    std::string tpl_seg_c_normal;   // watch+qty section for normal qty, ending with "&spnPrice="
+    std::string tpl_seg_c_circuit;  // watch+qty section for circuit qty, ending with "&spnPrice="
+    std::string tpl_seg_d;          // static suffix from "&cmbTif=16" to "&confirm=1"
+
+    // Duplicate-order ID pool — 64 pre-generated 10-char alphanumeric IDs.
+    // Rotated atomically with fetch_add & mask — zero RNG and zero allocation on hot path.
+    static constexpr int DUP_POOL_SIZE = 64;
+    char                 dup_pool[DUP_POOL_SIZE][10];
+    mutable std::atomic<uint8_t> dup_idx{0};
+
     ~Watch() {
-        if (order_curl) {
-            curl_easy_cleanup(order_curl);
-            order_curl = nullptr;
-        }
+        if (order_curl)  { curl_easy_cleanup(order_curl);  order_curl  = nullptr; }
+        if (warmup_curl) { curl_easy_cleanup(warmup_curl); warmup_curl = nullptr; }
         curl_slist_free_all(order_hdrs);
     }
 
@@ -601,6 +625,9 @@ static std::mutex                                              g_watches_mutex;
 
 // ── Shutdown flag ─────────────────────────────────────────────────────────────
 static std::atomic<bool> g_shutdown{false};
+// Market-open flag: updated by heartbeat every 100ms so the WS hot path pays
+// only a single relaxed atomic load instead of a gmtime() on every tick.
+static std::atomic<bool> g_market_open{false};
 
 // ── Print ─────────────────────────────────────────────────────────────────────
 static std::mutex g_print_mutex;
@@ -707,20 +734,23 @@ static void base64_decode_into(std::string_view in, std::vector<uint8_t>& out) {
 }
 
 // ── Utility: zlib decompress ──────────────────────────────────────────────────
+// RAII wrapper so inflateEnd() is called when the thread exits — prevents the
+// ~15 KB zlib internal state from leaking on every WS reconnect.
+struct ZStreamOwner {
+    z_stream zs  = {};
+    bool     ok  = false;
+    ZStreamOwner()  { ok = (inflateInit(&zs) == Z_OK); }
+    ~ZStreamOwner() { if (ok) inflateEnd(&zs); }
+};
+
 static void zlib_decompress_into(const std::vector<uint8_t>& compressed, std::string& out) {
     out.clear();
     if (compressed.empty()) return;
 
-    thread_local z_stream zs   = {};
-    thread_local bool     init = false;
-
-    if (!init) {
-        if (inflateInit(&zs) != Z_OK)
-            throw std::runtime_error("inflateInit failed");
-        init = true;
-    } else {
-        inflateReset(&zs);
-    }
+    thread_local ZStreamOwner owner;
+    if (!owner.ok) throw std::runtime_error("inflateInit failed");
+    z_stream& zs = owner.zs;
+    if (inflateReset(&zs) != Z_OK) throw std::runtime_error("inflateReset failed");
 
     zs.next_in  = const_cast<Bytef*>(compressed.data());
     zs.avail_in = (uInt)compressed.size();
@@ -752,22 +782,6 @@ static std::string url_encode(const std::string& s) {
         }
     }
     return out;
-}
-
-// ── Utility: zero-alloc Nth field access ──────────────────────────────────────
-static std::string_view nth_field(std::string_view s, char delim, int n) {
-    for (int i = 0; i < n; i++) {
-        auto pos = s.find(delim);
-        if (pos == std::string_view::npos) return {};
-        s = s.substr(pos + 1);
-    }
-    return s.substr(0, s.find(delim));
-}
-
-static int count_fields(std::string_view s, char delim) {
-    int n = 1;
-    for (char c : s) if (c == delim) ++n;
-    return n;
 }
 
 // ── Utility: UUID ─────────────────────────────────────────────────────────────
@@ -807,7 +821,7 @@ static size_t write_cb(char* ptr, size_t size, size_t nmemb, void* ud) {
 }
 
 // Permanent connection options — set ONCE at handle creation, NEVER called again.
-// curl_easy_reset() is never called on order handles: the TCP+TLS+HTTP2 connection
+// curl_easy_reset() is never called on order handles: the TCP+TLS+HTTP/1.1 connection
 // cache survives across all requests on the same handle.
 static void apply_conn_opts(CURL* c) {
     curl_easy_setopt(c, CURLOPT_NOSIGNAL,        1L);     // mandatory for multi-threaded
@@ -818,57 +832,32 @@ static void apply_conn_opts(CURL* c) {
     curl_easy_setopt(c, CURLOPT_MAXAGE_CONN,   1200L);
     curl_easy_setopt(c, CURLOPT_FORBID_REUSE,    0L);
     curl_easy_setopt(c, CURLOPT_FRESH_CONNECT,   0L);
-    curl_easy_setopt(c, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+    curl_easy_setopt(c, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1); // both Naasa (IIS) and ATRAD (Tomcat) are HTTP/1.1 only
 }
 
 // ── Order placement ───────────────────────────────────────────────────────────
-// Build ATRAD (Sweta Securities) order — form-encoded, matches browser POST in
-// necessary_endpoints/order. market_price = LTP, price = bid price (LTP * 1.02 cap).
-static std::string build_atrad_order_payload(const std::string& symbol, int qty,
-                                              double price, double market_price) {
-    char pbuf[32], mbuf[32];
-    snprintf(pbuf, sizeof(pbuf), "%.1f", price);
-    snprintf(mbuf, sizeof(mbuf), "%.1f", market_price);
 
-    std::string s;
-    s.reserve(1024);
-    s += "action=submitOrder";
-    s += "&market=NEPSE";
-    s += "&broker="           + url_encode(g_atrad_broker);
-    s += "&format=json";
-    s += "&clientOrderId=cseOrderId";
-    s += "&brokerClient=1";
-    s += "&orderStatus=Open";
-    s += "&filledQty=";
-    s += "&acntid="           + url_encode(g_atrad_acntid);
-    s += "&oldPrice=";
-    s += "&oldQty=";
-    s += "&remainder=";
-    s += "&orderplacedate=";
-    s += "&marketPrice="      + std::string(mbuf);
-    s += "&oldDisclose=";
-    s += "&txtContraBroker=110";
-    s += "&txtapprovalReason=";
-    s += "&txtsenttoapproval=no";
-    s += "&txtCompId=";
-    s += "&txtOdrStatus=";
-    s += "&duplicateOrderId=" + gen_atrad_dup_id();
-    s += "&product=web";
-    s += "&clientAcc="        + url_encode(g_atrad_client_acc);
-    s += "&assetSelect=1";
-    s += "&actionSelect=1";
-    s += "&txtSecurity="      + url_encode(symbol);
-    s += "&cmbTypeOfOrder=1";
-    s += "&spnQuantity="      + std::to_string(qty);
-    s += "&spnPrice="         + std::string(pbuf);
-    s += "&cmbTif=16";
-    s += "&cmbTifDays=1";
-    s += "&cmbBoard=1";
-    s += "&hiddenSpnCseFee=0.02";
-    s += "&txtContraBroker_=110";
-    s += "&brokerClientVal=1";
-    s += "&confirm=1";
-    return s;
+// Assemble the ATRAD order POST payload from per-watch pre-built segments.
+// Called with a thread_local string — capacity is preserved across calls.
+// Only 3 numeric values (ltp, dup_id, bid) are inserted; everything else is
+// a memcpy of a pre-built string_view — zero heap allocation after first call.
+static void assemble_payload(std::string& out, const Watch& w, bool at_circuit,
+                             double ltp, double bid) {
+    // std::to_chars: locale-free (no LC_NUMERIC comma corruption), no format string parse.
+    char ltp_buf[16], bid_buf[16];
+    const char* ltp_end = std::to_chars(ltp_buf, ltp_buf + sizeof(ltp_buf), ltp, std::chars_format::fixed, 1).ptr;
+    const char* bid_end = std::to_chars(bid_buf, bid_buf + sizeof(bid_buf), bid, std::chars_format::fixed, 1).ptr;
+    // Fetch next dup_id slot atomically — wraps in 64 without a branch.
+    const uint8_t slot = w.dup_idx.fetch_add(1, std::memory_order_relaxed)
+                         & (Watch::DUP_POOL_SIZE - 1);
+    out.clear();
+    out.append(w.tpl_seg_a);                                             // "...&marketPrice="
+    out.append(ltp_buf, ltp_end - ltp_buf);                              // e.g. "234.5"
+    out.append(w.tpl_seg_b);                                             // "&oldDisclose=...&duplicateOrderId="
+    out.append(w.dup_pool[slot], 10);                                    // pre-generated 10-char ID
+    out.append(at_circuit ? w.tpl_seg_c_circuit : w.tpl_seg_c_normal);  // "...&spnPrice="
+    out.append(bid_buf, bid_end - bid_buf);                              // e.g. "239.2"
+    out.append(w.tpl_seg_d);                                             // "&cmbTif=16...&confirm=1"
 }
 
 static void print_totals();  // forward decl
@@ -880,107 +869,91 @@ static bool is_order_success(long http_code, const std::string& body) {
     return body.find("\"code\":\"0\"") != std::string::npos;
 }
 
-// Place one order via ATRAD on watch->order_curl. Measures latency.
-// ltp   = raw LTP from WS tick (used as marketPrice in ATRAD payload)
-// price = bid price = min(floor(ltp*1.02*10)/10, circuit)
-static void place_order(double price, int qty, double ltp,
-                        const std::string& watch_id,
+// Place one ATRAD order. Called directly from WS thread with ctx->watch_ptr —
+// no g_watches_mutex lookup, no heap allocations on the hot path after warm-up.
+// price = bid = min(floor(ltp*1.02*10)/10, circuit),  ltp = raw tick value.
+// at_circuit selects tpl_seg_c_circuit (endingQty) vs tpl_seg_c_normal (qty).
+static void place_order(double price, bool at_circuit, double ltp,
+                        std::shared_ptr<Watch> watch,
                         std::chrono::steady_clock::time_point tick_time) {
-    std::shared_ptr<Watch> watch;
-    {
-        std::lock_guard<std::mutex> lk(g_watches_mutex);
-        auto it = g_watches.find(watch_id);
-        if (it == g_watches.end()) return;
-        watch = it->second;
-    }
+    // Thread-local buffers: capacity retained across calls → zero heap alloc after first.
+    thread_local std::string tl_payload;
+    thread_local std::string tl_body;
 
-    std::string payload = build_atrad_order_payload(watch->symbol, qty, price, ltp);
+    // Payload assembly: 2 snprintfs + 7 appends of pre-built segments — nothing else.
+    assemble_payload(tl_payload, *watch, at_circuit, ltp, price);
 
-    // Snapshot ATRAD cookie string — set once at login, no mutex needed on hot path.
-    std::string cookie_hdr = "Cookie: " + g_atrad_cookie_str;
-
-    auto do_post = [&]() -> HttpResponse {
-        std::lock_guard<std::mutex> wl(watch->order_curl_mutex);
-        std::string body;
-        body.reserve(4096);
-
-        // Build per-request header list — ATRAD form-encoded POST headers.
-        curl_slist* req_hdrs = nullptr;
-        req_hdrs = curl_slist_append(req_hdrs, cookie_hdr.c_str());
-        req_hdrs = curl_slist_append(req_hdrs,
-            "Content-Type: application/x-www-form-urlencoded");
-        req_hdrs = curl_slist_append(req_hdrs,
-            "x-requested-with: XMLHttpRequest");
-        req_hdrs = curl_slist_append(req_hdrs,
-            "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36");
-        req_hdrs = curl_slist_append(req_hdrs,
-            (std::string("Referer: ") + ATRAD_BASE + "/home?action=showHome&format=html").c_str());
-
-        // No curl_easy_reset() — permanent options survive, HTTP2 connection reused.
-        curl_easy_setopt(watch->order_curl, CURLOPT_URL,           ATRAD_ORDER_URL);
-        curl_easy_setopt(watch->order_curl, CURLOPT_POST,          1L);
-        curl_easy_setopt(watch->order_curl, CURLOPT_POSTFIELDS,    payload.c_str());
-        curl_easy_setopt(watch->order_curl, CURLOPT_POSTFIELDSIZE, (long)payload.size());
-        curl_easy_setopt(watch->order_curl, CURLOPT_HTTPHEADER,    req_hdrs);
-        curl_easy_setopt(watch->order_curl, CURLOPT_WRITEDATA,     &body);
-        curl_easy_perform(watch->order_curl);
-        curl_slist_free_all(req_hdrs);
-
-        long code = 0;
-        curl_easy_getinfo(watch->order_curl, CURLINFO_RESPONSE_CODE, &code);
-        return {code, body};
-    };
+    long   http_code = 0;
+    bool   success   = false;
+    std::string fail_msg; // only built on error path
 
     auto t_send = std::chrono::steady_clock::now();
-    HttpResponse r = do_post();
+    {
+        std::lock_guard<std::mutex> wl(watch->order_curl_mutex);
+        tl_body.clear();
+
+        // Pre-built watch->order_hdrs (no curl_slist_append on hot path).
+        // No curl_easy_reset() — permanent opts survive, HTTP/1.1 keep-alive reused.
+        curl_easy_setopt(watch->order_curl, CURLOPT_URL,           ATRAD_ORDER_URL);
+        curl_easy_setopt(watch->order_curl, CURLOPT_POST,          1L);
+        curl_easy_setopt(watch->order_curl, CURLOPT_POSTFIELDS,    tl_payload.c_str());
+        curl_easy_setopt(watch->order_curl, CURLOPT_POSTFIELDSIZE, (long)tl_payload.size());
+        curl_easy_setopt(watch->order_curl, CURLOPT_HTTPHEADER,    watch->order_hdrs);
+        curl_easy_setopt(watch->order_curl, CURLOPT_WRITEDATA,     &tl_body);
+        CURLcode ce = curl_easy_perform(watch->order_curl);
+        curl_easy_getinfo(watch->order_curl, CURLINFO_RESPONSE_CODE, &http_code);
+        if (ce != CURLE_OK)
+            watch_log(watch->id, std::string("curl: ") + curl_easy_strerror(ce), "error");
+
+        success = is_order_success(http_code, tl_body);
+        if (!success) {
+            try {
+                json resp = json::parse(fix_atrad_json(tl_body));
+                fail_msg  = resp.value("description", tl_body.substr(0, 200));
+            } catch (...) { fail_msg = tl_body.substr(0, 200); }
+        }
+    }
     auto t_recv = std::chrono::steady_clock::now();
 
     int64_t rtt_us = std::chrono::duration_cast<std::chrono::microseconds>(t_recv - t_send).count();
     int64_t t2o_us = std::chrono::duration_cast<std::chrono::microseconds>(t_send - tick_time).count();
+    const int qty = at_circuit ? watch->endingQty : watch->qty;
+    double spent = 0.0;
     {
+        // Single lock — record latency and order in one acquisition.
         std::lock_guard<std::mutex> ll(watch->lat_mutex);
         watch->tick_to_order_us.push_back(t2o_us);
         watch->api_rtt_us.push_back(rtt_us);
-    }
-
-    auto handle_success = [&]() {
-        double spent;
-        {
-            std::lock_guard<std::mutex> ll(watch->lat_mutex);
+        if (success) {
             watch->orders.push_back({price, qty});
             watch->spent += price * qty;
             spent = watch->spent;
         }
+    }
 
+    if (success) {
         std::ostringstream ss;
         ss << std::fixed << std::setprecision(1);
         ss << BGN_ << "  ★ ORDER PLACED" << R_
-           << "  watch=" << BCY_ << watch_id << R_
+           << "  watch=" << BCY_ << watch->id << R_
            << "  price=" << B_ << price << R_
            << "  qty=" << B_ << qty << R_
+           << "  rtt=" << (rtt_us / 1000) << "ms"
+           << "  t2o=" << t2o_us << "µs"
            << "  spent=" << BGN_ << "Rs " << spent << R_
            << " / Rs " << watch->maxSpend;
         cprint(ss.str());
         print_totals();
-
         if (spent >= watch->maxSpend) {
             cprint(std::string(YL_) + "  [BUDGET HIT]" + R_
-                   + "  watch=" + watch_id + " — stopping");
+                   + "  watch=" + watch->id + " — stopping");
             watch->stop.store(true);
         }
-    };
+        return;
+    }
 
-    if (is_order_success(r.status, r.body)) { handle_success(); return; }
-
-    // Order failed — log ATRAD description/error from response
-    std::string msg;
-    try {
-        auto body_fixed = fix_atrad_json(r.body);
-        json resp = json::parse(body_fixed);
-        msg = resp.value("description", r.body.substr(0, 300));
-    } catch (...) { msg = r.body.substr(0, 300); }
-    watch_log(watch_id, "Order failed (HTTP " + std::to_string(r.status) + "): " + msg, "error");
+    watch_log(watch->id,
+              "Order FAILED (HTTP " + std::to_string(http_code) + "): " + fail_msg, "error");
 }
 
 // ── Naasa WebSocket (libwebsockets) ───────────────────────────────────────────
@@ -1081,13 +1054,11 @@ static int naasa_ws_callback(struct lws* wsi, enum lws_callback_reasons reason,
         ctx->rx_buf.append((const char*)in, len);
         if (!lws_is_final_fragment(wsi)) break;
 
-        std::string raw = std::move(ctx->rx_buf);
-        ctx->rx_buf.clear();
-
-        if (raw.empty()) break;
+        if (ctx->rx_buf.empty()) break;
+        const std::string& raw = ctx->rx_buf;  // reference — keeps heap capacity for next packet
 
         auto caret = raw.find('^');
-        if (caret == std::string::npos) break;
+        if (caret == std::string::npos) { ctx->rx_buf.clear(); break; }
 
         std::string_view prefix(raw.data(), caret);
 
@@ -1110,7 +1081,7 @@ static int naasa_ws_callback(struct lws* wsi, enum lws_callback_reasons reason,
             base64_decode_into(payload, tl_b64_buf);
             zlib_decompress_into(tl_b64_buf, tl_decomp_buf);
         } catch (...) {
-            break;
+            ctx->rx_buf.clear(); break;
         }
         const std::string& decoded = tl_decomp_buf;
 
@@ -1122,11 +1093,24 @@ static int naasa_ws_callback(struct lws* wsi, enum lws_callback_reasons reason,
             if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
             if (line.empty()) continue;
 
-            if (count_fields(line, '$') < 5) continue;
-
-            auto msg_type = nth_field(line, '$', 0);
-            auto ver_sym  = nth_field(line, '$', 2);
-            auto data_sv  = nth_field(line, '$', 4);
+            // Single-pass '$' field extraction: grab fields 0, 2, 4 in one scan.
+            std::string_view msg_type, ver_sym, data_sv;
+            {
+                int   field = 0;
+                size_t start = 0;
+                bool  got4  = false;
+                for (size_t i = 0; i <= line.size(); i++) {
+                    if (i == line.size() || line[i] == '$') {
+                        std::string_view fv = line.substr(start, i - start);
+                        if      (field == 0) msg_type = fv;
+                        else if (field == 2) ver_sym  = fv;
+                        else if (field == 4) { data_sv = fv; got4 = true; break; }
+                        field++;
+                        start = i + 1;
+                    }
+                }
+                if (!got4) continue;
+            }
 
             if (msg_type != "1") continue;
             if (ver_sym.size() < 5 || ver_sym.substr(0, 4) != "25.1") continue;
@@ -1134,29 +1118,45 @@ static int naasa_ws_callback(struct lws* wsi, enum lws_callback_reasons reason,
             auto bang = ver_sym.find('!');
             if (bang == std::string_view::npos) continue;
             auto sym = ver_sym.substr(bang + 1);
-
             if (sym != ctx->symbol) continue;
 
-            if (count_fields(data_sv, '^') < 15) continue;
-            auto ltp_sv = nth_field(data_sv, '^', 0);
-            auto pc_sv  = nth_field(data_sv, '^', 14);
-
-            double ltp = 0.0, prev_close = 0.0;
+            // Single-pass '^' field extraction: grab fields 0 and 14 in one scan.
+            std::string_view ltp_sv, pc_sv;
             {
-                char* e;
-                ltp = std::strtod(ltp_sv.data(), &e);
-                if (e == ltp_sv.data()) continue;
-                prev_close = std::strtod(pc_sv.data(), &e);
-                if (e == pc_sv.data()) continue;
+                int   field = 0;
+                size_t start = 0;
+                bool  got14 = false;
+                for (size_t i = 0; i <= data_sv.size(); i++) {
+                    if (i == data_sv.size() || data_sv[i] == '^') {
+                        std::string_view fv = data_sv.substr(start, i - start);
+                        if (field == 0)  ltp_sv = fv;
+                        if (field == 14) { pc_sv = fv; got14 = true; break; }
+                        field++;
+                        start = i + 1;
+                    }
+                }
+                if (!got14) continue;
             }
 
-            ctx->watch_ptr->open_price.store(prev_close, std::memory_order_relaxed);
+            // from_chars: bounds-aware, locale-free — no strtod locale mutex.
+            double ltp = 0.0, prev_close = 0.0;
+            {
+                auto r1 = std::from_chars(ltp_sv.data(), ltp_sv.data() + ltp_sv.size(), ltp);
+                if (r1.ec != std::errc{}) continue;
+                auto r2 = std::from_chars(pc_sv.data(),  pc_sv.data()  + pc_sv.size(),  prev_close);
+                if (r2.ec != std::errc{}) continue;
+            }
+
+            // Conditional store — prev_close rarely changes (it's the prior day's close).
+            // Unconditional store on every tick dirties the cache line for all readers.
+            if (ctx->watch_ptr->open_price.load(std::memory_order_relaxed) != prev_close)
+                ctx->watch_ptr->open_price.store(prev_close, std::memory_order_relaxed);
 
             double circuit    = std::floor(prev_close * 1.10 * 10.0) / 10.0;
             double bid_price  = std::min(std::floor(ltp * 1.02 * 10.0) / 10.0, circuit);
             bool   at_circuit = bid_price >= circuit;
 
-            if (!is_market_open()) {
+            if (!g_market_open.load(std::memory_order_relaxed)) {
                 char tbuf[96];
                 snprintf(tbuf, sizeof(tbuf), "Tick  LTP=%.1f  bid=%.1f  circuit=%.1f%s",
                          ltp, bid_price, circuit, at_circuit ? "  [CIRCUIT]" : "");
@@ -1164,7 +1164,6 @@ static int naasa_ws_callback(struct lws* wsi, enum lws_callback_reasons reason,
                 continue;
             }
 
-            int    qty      = 0;
             double prev_ltp = -1.0;
             bool   is_first = false;
 
@@ -1174,19 +1173,20 @@ static int naasa_ws_callback(struct lws* wsi, enum lws_callback_reasons reason,
                 std::lock_guard<std::mutex> ll(w.lat_mutex);
                 is_first = !w.first_order_done.load(std::memory_order_relaxed);
                 prev_ltp = w.last_ltp.load(std::memory_order_relaxed);
-                qty      = at_circuit ? w.endingQty : w.qty;
                 if (is_first) {
-                    w.first_order_done.store(true,    std::memory_order_relaxed);
-                    w.last_ltp.store(ltp,             std::memory_order_relaxed);
+                    w.first_order_done.store(true, std::memory_order_relaxed);
+                    w.last_ltp.store(ltp,          std::memory_order_relaxed);
                 } else if (prev_ltp != ltp) {
-                    w.last_ltp.store(ltp,             std::memory_order_relaxed);
+                    w.last_ltp.store(ltp,          std::memory_order_relaxed);
                 }
             }
 
             if (is_first || (prev_ltp >= 0 && prev_ltp != ltp)) {
-                place_order(bid_price, qty, ltp, ctx->watch_id, t_recv);
+                // Pass watch_ptr + at_circuit directly — no lock, no qty lookup.
+                place_order(bid_price, at_circuit, ltp, ctx->watch_ptr, t_recv);
             }
         }
+        ctx->rx_buf.clear();  // keep heap capacity for next packet
         break;
     }
 
@@ -1372,9 +1372,12 @@ static void heartbeat_loop() {
     auto last_asp_session_touch = std::chrono::steady_clock::now();
     // ATRAD checkUserSession keepalive every 30s — keeps JSESSIONID alive.
     auto last_atrad_keepalive   = std::chrono::steady_clock::now();
-    // Continuous order_curl warmup: GET ATRAD marketStatus every 5s on all active watches.
-    // Same host:port as order URL → HTTP/2 connection never idles out.
+    // warmup_curl keepalive: GET ATRAD marketStatus every 2s.
     auto last_order_warmup      = std::chrono::steady_clock::now();
+    // order_curl POST warmup every 200ms — keeps Tomcat POST handler hot so
+    // Shot 1 RTT matches steady-state. Dummy payload hits order servlet,
+    // returns immediate error, never places a real order.
+    auto last_order_curl_warmup = std::chrono::steady_clock::now();
     // Pre-market warmup at 10:59:55 NST.
     bool warmup_done = false;
 
@@ -1396,36 +1399,41 @@ static void heartbeat_loop() {
             last_atrad_keepalive = std::chrono::steady_clock::now();
         }
 
-        // Continuous order_curl keepalive: GET ATRAD marketStatus every 5s.
-        // Same host:port as order URL → HTTP/2 connection never idles out.
+        // ATRAD connection keepalive every 2s — both handles per watch.
+        // warmup_curl: always warmed (blocking lock, dedicated handle).
+        // order_curl:  warmed via try_lock — non-blocking, zero Deadly Embrace risk.
+        //   If try_lock fails, the WS thread is placing an order right now → connection alive.
+        //   If try_lock succeeds, do a quick GET to prevent cold TLS on the next order.
+        // 2s interval chosen: safer margin against Tomcat's ~20s keep-alive timeout.
         if (std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::steady_clock::now() - last_order_warmup).count() >= 5) {
+                std::chrono::steady_clock::now() - last_order_warmup).count() >= 2) {
             last_order_warmup = std::chrono::steady_clock::now();
             std::vector<std::shared_ptr<Watch>> snaps;
             {
                 std::lock_guard<std::mutex> lk(g_watches_mutex);
                 for (auto& [wid, w] : g_watches)
-                    if (!w->stop.load() && w->order_curl) snaps.push_back(w);
+                    if (!w->stop.load() && w->warmup_curl) snaps.push_back(w);
             }
-            std::string ck_hdr = "Cookie: " + g_atrad_cookie_str;
             std::string warmup_url = std::string(ATRAD_BASE)
                                      + "/home?action=marketStatus&dojo.preventCache="
                                      + std::to_string((long)(std::chrono::duration_cast<
                                          std::chrono::milliseconds>(
                                          std::chrono::system_clock::now().time_since_epoch())
                                          .count()));
+            std::string body;
             for (auto& w : snaps) {
-                std::lock_guard<std::mutex> wl(w->order_curl_mutex);
                 curl_slist* wh = nullptr;
-                wh = curl_slist_append(wh, ck_hdr.c_str());
+                wh = curl_slist_append(wh, g_atrad_cookie_hdr.c_str());
                 wh = curl_slist_append(wh, "x-requested-with: XMLHttpRequest");
-                std::string body;
-                // No reset — only switch method+URL, permanent options intact.
-                curl_easy_setopt(w->order_curl, CURLOPT_URL,        warmup_url.c_str());
-                curl_easy_setopt(w->order_curl, CURLOPT_HTTPGET,    1L);
-                curl_easy_setopt(w->order_curl, CURLOPT_HTTPHEADER, wh);
-                curl_easy_setopt(w->order_curl, CURLOPT_WRITEDATA,  &body);
-                curl_easy_perform(w->order_curl);
+                {
+                    std::lock_guard<std::mutex> wl(w->warmup_curl_mutex);
+                    body.clear();
+                    curl_easy_setopt(w->warmup_curl, CURLOPT_URL,        warmup_url.c_str());
+                    curl_easy_setopt(w->warmup_curl, CURLOPT_HTTPGET,    1L);
+                    curl_easy_setopt(w->warmup_curl, CURLOPT_HTTPHEADER, wh);
+                    curl_easy_setopt(w->warmup_curl, CURLOPT_WRITEDATA,  &body);
+                    curl_easy_perform(w->warmup_curl);
+                }
                 curl_slist_free_all(wh);
             }
         }
@@ -1493,11 +1501,11 @@ static void heartbeat_loop() {
                         auto it = g_watches.find(wid);
                         if (it != g_watches.end()) w_ptr = it->second;
                     }
-                    if (!w_ptr || !w_ptr->order_curl) continue;
+                    if (!w_ptr || !w_ptr->warmup_curl) continue;
                     {
-                        std::lock_guard<std::mutex> wl(w_ptr->order_curl_mutex);
+                        // Pre-market warmup uses warmup_curl — never order_curl.
+                        std::lock_guard<std::mutex> wl(w_ptr->warmup_curl_mutex);
                         std::string body;
-                        std::string w_ck2 = "Cookie: " + g_atrad_cookie_str;
                         std::string wu2 = std::string(ATRAD_BASE)
                                           + "/home?action=marketStatus&dojo.preventCache="
                                           + std::to_string((long)(std::chrono::duration_cast<
@@ -1505,14 +1513,13 @@ static void heartbeat_loop() {
                                               std::chrono::system_clock::now().time_since_epoch())
                                               .count()));
                         curl_slist* wh2 = nullptr;
-                        wh2 = curl_slist_append(wh2, w_ck2.c_str());
+                        wh2 = curl_slist_append(wh2, g_atrad_cookie_hdr.c_str()); // pre-built
                         wh2 = curl_slist_append(wh2, "x-requested-with: XMLHttpRequest");
-                        // No reset — only switch method+URL, permanent options intact.
-                        curl_easy_setopt(w_ptr->order_curl, CURLOPT_URL,        wu2.c_str());
-                        curl_easy_setopt(w_ptr->order_curl, CURLOPT_HTTPGET,    1L);
-                        curl_easy_setopt(w_ptr->order_curl, CURLOPT_HTTPHEADER, wh2);
-                        curl_easy_setopt(w_ptr->order_curl, CURLOPT_WRITEDATA,  &body);
-                        curl_easy_perform(w_ptr->order_curl);
+                        curl_easy_setopt(w_ptr->warmup_curl, CURLOPT_URL,        wu2.c_str());
+                        curl_easy_setopt(w_ptr->warmup_curl, CURLOPT_HTTPGET,    1L);
+                        curl_easy_setopt(w_ptr->warmup_curl, CURLOPT_HTTPHEADER, wh2);
+                        curl_easy_setopt(w_ptr->warmup_curl, CURLOPT_WRITEDATA,  &body);
+                        curl_easy_perform(w_ptr->warmup_curl);
                         curl_slist_free_all(wh2);
                     }
                     sys_log("Pre-market warmup done for watch " + wid, "ok");
@@ -1520,8 +1527,46 @@ static void heartbeat_loop() {
             }
         }
 
-        for (int i = 0; i < 50 && !g_hb_stop.load(); i++)
+        // Sleep loop: 100ms ticks.
+        // g_market_open cached here — WS hot path pays one relaxed atomic load, not gmtime().
+        // warmup_curl POST to order endpoint every 200ms warms Tomcat POST handler.
+        // order_curl is NEVER touched here — zero contention with the LTP reaction path.
+        static const std::string DUMMY_POST = "action=getOrderStatus&format=json";
+        for (int i = 0; i < 50 && !g_hb_stop.load(); i++) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+            // Update market-open cache every 100ms.
+            {
+                int s = nepal_secs_since_midnight();
+                g_market_open.store(s > (11 * 3600) && s < (15 * 3600),
+                                    std::memory_order_relaxed);
+            }
+
+            auto now_wu = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now_wu - last_order_curl_warmup).count() >= 200) {
+                last_order_curl_warmup = now_wu;
+                // POST via warmup_curl (heartbeat-only handle) — never blocks order_curl.
+                std::vector<std::shared_ptr<Watch>> wsnaps;
+                {
+                    std::lock_guard<std::mutex> lk(g_watches_mutex);
+                    for (auto& [wid, w] : g_watches)
+                        if (!w->stop.load() && w->warmup_curl) wsnaps.push_back(w);
+                }
+                std::string dbody;
+                for (auto& w : wsnaps) {
+                    std::lock_guard<std::mutex> wl(w->warmup_curl_mutex);
+                    dbody.clear();
+                    curl_easy_setopt(w->warmup_curl, CURLOPT_URL,           ATRAD_ORDER_URL);
+                    curl_easy_setopt(w->warmup_curl, CURLOPT_POST,          1L);
+                    curl_easy_setopt(w->warmup_curl, CURLOPT_POSTFIELDS,    DUMMY_POST.c_str());
+                    curl_easy_setopt(w->warmup_curl, CURLOPT_POSTFIELDSIZE, (long)DUMMY_POST.size());
+                    curl_easy_setopt(w->warmup_curl, CURLOPT_HTTPHEADER,    w->order_hdrs);
+                    curl_easy_setopt(w->warmup_curl, CURLOPT_WRITEDATA,     &dbody);
+                    curl_easy_perform(w->warmup_curl);
+                }
+            }
+        }
     }
 }
 
@@ -1635,14 +1680,12 @@ static void cmd_add_watch() {
     watch->endingQty   = ending_qty;
     watch->maxSpend    = max_spend;
 
-    // Per-watch order handle: independent curl handle for ATRAD order POSTs.
-    // No curl_easy_reset() is ever called after initial setup — connection cache survives.
+    // ── order_curl: dedicated handle for order POSTs only ────────────────────────
+    // Never reset, never touched by heartbeat. HTTP/1.1 keep-alive persists.
     watch->order_curl = curl_easy_init();
     if (!watch->order_curl) {
-        cprint(std::string(RD_) + "  curl_easy_init failed for watch order handle." + R_);
-        return;
+        cprint(std::string(RD_) + "  curl_easy_init failed (order_curl)." + R_); return;
     }
-    // Permanent options — set once, survive for the handle's entire lifetime.
     curl_easy_setopt(watch->order_curl, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(watch->order_curl, CURLOPT_SSL_VERIFYHOST, 0L);
     curl_easy_setopt(watch->order_curl, CURLOPT_TCP_NODELAY,    1L);
@@ -1651,24 +1694,103 @@ static void cmd_add_watch() {
     curl_easy_setopt(watch->order_curl, CURLOPT_WRITEFUNCTION,  write_cb);
     apply_conn_opts(watch->order_curl);
 
-    // Initial warmup: establish TCP+TLS+HTTP2 to ATRAD host immediately.
+    // ── warmup_curl: heartbeat-only handle ───────────────────────────────────────
+    // Heartbeat GETs never block the order path. Separate TCP connection to same host.
+    watch->warmup_curl = curl_easy_init();
+    if (!watch->warmup_curl) {
+        cprint(std::string(RD_) + "  curl_easy_init failed (warmup_curl)." + R_); return;
+    }
+    curl_easy_setopt(watch->warmup_curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(watch->warmup_curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    curl_easy_setopt(watch->warmup_curl, CURLOPT_TCP_NODELAY,    1L);
+    curl_easy_setopt(watch->warmup_curl, CURLOPT_RESOLVE,        g_dns_pins);
+    curl_easy_setopt(watch->warmup_curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(watch->warmup_curl, CURLOPT_WRITEFUNCTION,  write_cb);
+    apply_conn_opts(watch->warmup_curl);
+
+    // ── Pre-build order_hdrs once — reused on every order, zero malloc on hot path ─
+    // Cookie is set at login and never changes during a trading session.
+    watch->order_hdrs = curl_slist_append(watch->order_hdrs, g_atrad_cookie_hdr.c_str());
+    watch->order_hdrs = curl_slist_append(watch->order_hdrs,
+        "Content-Type: application/x-www-form-urlencoded");
+    watch->order_hdrs = curl_slist_append(watch->order_hdrs,
+        "x-requested-with: XMLHttpRequest");
+    watch->order_hdrs = curl_slist_append(watch->order_hdrs,
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36");
+    watch->order_hdrs = curl_slist_append(watch->order_hdrs,
+        (std::string("Referer: ") + ATRAD_BASE + "/home?action=showHome&format=html").c_str());
+
+    // ── Pre-build payload template segments ──────────────────────────────────────
+    // Everything static baked in once. At order time: 2 snprintfs + 7 appends.
     {
-        std::string w_ck = "Cookie: " + g_atrad_cookie_str;
+        const std::string sym_enc  = url_encode(symbol_str);
+        const std::string qty_s    = std::to_string(qty);
+        const std::string eq_s     = std::to_string(ending_qty);
+
+        watch->tpl_seg_a =
+            std::string("action=submitOrder&market=NEPSE&broker=") + g_atrad_broker_enc
+            + "&format=json&clientOrderId=cseOrderId&brokerClient=1&orderStatus=Open"
+              "&filledQty=&acntid=" + g_atrad_acntid_enc
+            + "&oldPrice=&oldQty=&remainder=&orderplacedate=&marketPrice=";
+
+        watch->tpl_seg_b =
+            "&oldDisclose=&txtContraBroker=110&txtapprovalReason="
+            "&txtsenttoapproval=no&txtCompId=&txtOdrStatus=&duplicateOrderId=";
+
+        const std::string seg_c_common =
+            std::string("&product=web&clientAcc=") + g_atrad_client_acc_enc
+            + "&assetSelect=1&actionSelect=1&txtSecurity=" + sym_enc
+            + "&cmbTypeOfOrder=1&spnQuantity=";
+        watch->tpl_seg_c_normal  = seg_c_common + qty_s + "&spnPrice=";
+        watch->tpl_seg_c_circuit = seg_c_common + eq_s  + "&spnPrice=";
+
+        watch->tpl_seg_d =
+            "&cmbTif=16&cmbTifDays=1&cmbBoard=1&hiddenSpnCseFee=0.02"
+            "&txtContraBroker_=110&brokerClientVal=1&confirm=1";
+    }
+
+    // ── Pre-generate 64-slot duplicate-order ID pool ──────────────────────────────
+    // Eliminates RNG and heap allocation from the order hot path entirely.
+    {
+        static const char CHARS[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        std::mt19937 rng(std::random_device{}());
+        std::uniform_int_distribution<int> dist(0, 61);
+        for (auto& slot : watch->dup_pool)
+            for (char& c : slot) c = CHARS[dist(rng)];
+    }
+
+    // ── Initial warmup: establish TCP+TLS to ATRAD immediately ───────────────────
+    {
         std::string warmup_url = std::string(ATRAD_BASE)
                                  + "/home?action=marketStatus&dojo.preventCache="
                                  + std::to_string((long)(std::chrono::duration_cast<
                                      std::chrono::milliseconds>(
                                      std::chrono::system_clock::now().time_since_epoch())
                                      .count()));
-        curl_slist* wh = nullptr;
-        wh = curl_slist_append(wh, w_ck.c_str());
-        wh = curl_slist_append(wh, "x-requested-with: XMLHttpRequest");
         std::string dummy;
-        curl_easy_setopt(watch->order_curl, CURLOPT_URL,        warmup_url.c_str());
-        curl_easy_setopt(watch->order_curl, CURLOPT_HTTPGET,    1L);
-        curl_easy_setopt(watch->order_curl, CURLOPT_HTTPHEADER, wh);
-        curl_easy_setopt(watch->order_curl, CURLOPT_WRITEDATA,  &dummy);
+        // Prime order_curl with POST to order endpoint — establishes TCP+TLS and
+        // leaves handle in POST mode identical to place_order's steady state.
+        // Heartbeat NEVER touches order_curl after this point.
+        static const char INIT_POST[] = "action=getOrderStatus&format=json";
+        curl_easy_setopt(watch->order_curl, CURLOPT_URL,           ATRAD_ORDER_URL);
+        curl_easy_setopt(watch->order_curl, CURLOPT_POST,          1L);
+        curl_easy_setopt(watch->order_curl, CURLOPT_POSTFIELDS,    INIT_POST);
+        curl_easy_setopt(watch->order_curl, CURLOPT_POSTFIELDSIZE, (long)(sizeof(INIT_POST) - 1));
+        curl_easy_setopt(watch->order_curl, CURLOPT_HTTPHEADER,    watch->order_hdrs);
+        curl_easy_setopt(watch->order_curl, CURLOPT_WRITEDATA,     &dummy);
         curl_easy_perform(watch->order_curl);
+
+        // Prime warmup_curl with GET to marketStatus (heartbeat GET keepalive path).
+        curl_slist* wh = nullptr;
+        wh = curl_slist_append(wh, g_atrad_cookie_hdr.c_str());
+        wh = curl_slist_append(wh, "x-requested-with: XMLHttpRequest");
+        curl_easy_setopt(watch->warmup_curl, CURLOPT_URL,        warmup_url.c_str());
+        curl_easy_setopt(watch->warmup_curl, CURLOPT_HTTPGET,    1L);
+        curl_easy_setopt(watch->warmup_curl, CURLOPT_HTTPHEADER, wh);
+        curl_easy_setopt(watch->warmup_curl, CURLOPT_WRITEDATA,  &dummy);
+        curl_easy_perform(watch->warmup_curl);
         curl_slist_free_all(wh);
     }
 
@@ -1962,45 +2084,31 @@ static void cmd_fire(const std::string& sym) {
     std::string dummy;
     std::getline(std::cin, dummy);
 
-    // 3. Build ATRAD payload + header list — reused for every shot.
-    //    Uses watch->order_curl (already warm from 5s heartbeat GET marketStatus).
-    //    market_price = future_ltp (user-supplied), bid = calculated ceiling bid.
-    std::string payload = build_atrad_order_payload(watch->symbol, qty, bid, future_ltp);
-    std::string fire_cookie_hdr = "Cookie: " + g_atrad_cookie_str;
-    curl_slist* hdrs_snap = nullptr;
-    hdrs_snap = curl_slist_append(hdrs_snap, fire_cookie_hdr.c_str());
-    hdrs_snap = curl_slist_append(hdrs_snap,
-        "Content-Type: application/x-www-form-urlencoded");
-    hdrs_snap = curl_slist_append(hdrs_snap,
-        "x-requested-with: XMLHttpRequest");
-    hdrs_snap = curl_slist_append(hdrs_snap,
-        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36");
-    hdrs_snap = curl_slist_append(hdrs_snap,
-        (std::string("Referer: ") + ATRAD_BASE + "/home?action=showHome&format=html").c_str());
-
-    // 4b. 3-second countdown — switch to Naasa web tab, prepare to click SELL.
+    // 3. 3-second countdown — switch to Naasa web tab, prepare to click SELL.
     for (int i = 3; i >= 1; --i) {
         cprint(std::string("  ") + YL_ + "Firing in " + std::to_string(i) + "s...  ← switch to Naasa tab now" + R_);
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
     cprint(std::string("  ") + RD_ + B_ + "★ FIRE!  ← CLICK SELL NOW" + R_);
 
-    // 5. Up to 7 shots; stop on first success (ErrorCode == 0).
-    //    Uses watch->order_curl (warm from 5s heartbeat) — no new TCP/TLS/HTTP2 setup.
-    //    curl_easy_reset preserves the connection cache so the warm HTTP/2 stream survives.
+    // 4. Up to 7 shots; stop on first success.
+    //    Each shot gets a fresh dup_id from the pre-generated pool (atomic rotation).
+    //    Uses watch->order_curl (warm from 2s heartbeat) — no new TCP/TLS setup.
     const int MAX_SHOTS = 7;
+    std::string payload;   // re-assembled per shot for fresh dup_id
     std::string shot_body;
     shot_body.reserve(256);
     for (int shot = 1; shot <= MAX_SHOTS; ++shot) {
+        // Assemble payload fresh each shot — different dup_id, same bid/ltp.
+        assemble_payload(payload, *watch, true /*circuit qty*/, future_ltp, bid);
         double rtt_ms = 0.0;
         long status;
         {
             std::lock_guard<std::mutex> wl(watch->order_curl_mutex);
-            // No reset — permanent options intact, HTTP2 connection reused from 5s warmup.
+            // No reset — permanent options intact, HTTP/1.1 keep-alive reused from 2s warmup.
             curl_easy_setopt(watch->order_curl, CURLOPT_URL,  ATRAD_ORDER_URL);
             curl_easy_setopt(watch->order_curl, CURLOPT_POST, 1L);
-            status = fire_shot(watch->order_curl, payload, hdrs_snap, shot_body, rtt_ms);
+            status = fire_shot(watch->order_curl, payload, watch->order_hdrs, shot_body, rtt_ms);
         }
         bool ok = is_order_success(status, shot_body);
         {
@@ -2030,12 +2138,10 @@ static void cmd_fire(const std::string& sym) {
                        + "  watch=" + watch->id + " — stopping");
                 watch->stop.store(true);
             }
-            curl_slist_free_all(hdrs_snap);
             return;
         }
     }
     cprint(std::string("  ") + YL_ + "Fire sequence done — no success received." + R_);
-    curl_slist_free_all(hdrs_snap);
 }
 
 static void cmd_print_help() {
@@ -2101,10 +2207,12 @@ static void shutdown_all() {
     cmd_print_summary();
 }
 
-// Signal handler: set atomic flag and unblock getline by closing stdin.
+// Signal handler: set atomic flag and unblock getline.
 static void sig_handler(int) {
     g_shutdown.store(true);
-#ifndef _WIN32
+#ifdef _WIN32
+    CancelIoEx(GetStdHandle(STD_INPUT_HANDLE), NULL); // unblocks getline on Windows
+#else
     ::close(STDIN_FILENO);
 #endif
 }
@@ -2325,25 +2433,10 @@ int main() {
 
     g_atrad_curl = curl_easy_init();
     if (!g_atrad_curl) { fprintf(stderr, "curl_easy_init failed (ATRAD)\n"); return 1; }
-    curl_easy_setopt(g_atrad_curl, CURLOPT_COOKIEFILE,  "");  // enable in-memory cookie engine
-    curl_easy_setopt(g_atrad_curl, CURLOPT_TCP_NODELAY, 1L);
-    curl_easy_setopt(g_atrad_curl, CURLOPT_RESOLVE,     g_dns_pins);
-
-    // Build static order headers — mirrors Rust build_order_headers() exactly.
-    // Cookie is injected per-request as an explicit Cookie: header in req_hdrs.
-    g_naasa_order_hdrs = curl_slist_append(g_naasa_order_hdrs,
-        "Accept: application/json, text/javascript, */*; q=0.01");
-    g_naasa_order_hdrs = curl_slist_append(g_naasa_order_hdrs,
-        "Content-Type: application/json; charset=UTF-8");
-    g_naasa_order_hdrs = curl_slist_append(g_naasa_order_hdrs,
-        "X-Requested-With: XMLHttpRequest");
-    g_naasa_order_hdrs = curl_slist_append(g_naasa_order_hdrs,
-        (std::string("Origin: ") + NAASA_BASE).c_str());
-    g_naasa_order_hdrs = curl_slist_append(g_naasa_order_hdrs,
-        (std::string("Referer: ") + NAASA_BASE + "/MarketOrder/Order").c_str());
-    g_naasa_order_hdrs = curl_slist_append(g_naasa_order_hdrs,
-        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36");
+    curl_easy_setopt(g_atrad_curl, CURLOPT_COOKIEFILE,   "");  // enable in-memory cookie engine
+    curl_easy_setopt(g_atrad_curl, CURLOPT_TCP_NODELAY,  1L);
+    curl_easy_setopt(g_atrad_curl, CURLOPT_RESOLVE,      g_dns_pins);
+    curl_easy_setopt(g_atrad_curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
 
     lws_set_log_level(0, nullptr);
 
@@ -2359,7 +2452,6 @@ int main() {
     }
 
     if (!g_logged_in.load()) {
-        curl_slist_free_all(g_naasa_order_hdrs);
         curl_slist_free_all(g_dns_pins);
         curl_easy_cleanup(g_naasa_curl);
         if (g_atrad_curl) curl_easy_cleanup(g_atrad_curl);
@@ -2378,7 +2470,8 @@ int main() {
         cmd.erase(0, cmd.find_first_not_of(" \t"));
         if (cmd.empty()) continue;
         cmd.erase(cmd.find_last_not_of(" \t\r\n") + 1);
-        std::transform(cmd.begin(), cmd.end(), cmd.begin(), ::tolower);
+        std::transform(cmd.begin(), cmd.end(), cmd.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
 
         if      (cmd == "add")     cmd_add_watch();
         else if (cmd == "list")    cmd_list_watches();
@@ -2447,7 +2540,6 @@ int main() {
         g_watches.clear();
     }
 
-    curl_slist_free_all(g_naasa_order_hdrs);
     curl_slist_free_all(g_dns_pins);
     curl_easy_cleanup(g_naasa_curl);
     if (g_atrad_curl) curl_easy_cleanup(g_atrad_curl);
