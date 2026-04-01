@@ -1176,7 +1176,11 @@ static int naasa_ws_callback(struct lws* wsi, enum lws_callback_reasons reason,
                 for (size_t i = 0; i <= line.size(); i++) {
                     if (i == line.size() || line[i] == '$') {
                         std::string_view fv = line.substr(start, i - start);
-                        if      (field == 0) msg_type = fv;
+                        if (field == 0) {
+                            msg_type = fv;
+                            // Early exit: only type "1" carries price data.
+                            if (msg_type != "1") break;
+                        }
                         else if (field == 2) ver_sym  = fv;
                         else if (field == 4) { data_sv = fv; got4 = true; break; }
                         field++;
@@ -1898,6 +1902,11 @@ static void cmd_add_watch() {
         for (auto& slot : watch->dup_pool)
             for (char& c : slot) c = CHARS[dist(rng)];
     }
+
+    // Pre-reserve latency vectors — prevents reallocation during trading.
+    watch->tick_to_order_us.reserve(500);
+    watch->api_rtt_us.reserve(500);
+    watch->orders.reserve(500);
 
     // ── Initial warmup: establish TCP+TLS to ATRAD immediately ───────────────────
     {
