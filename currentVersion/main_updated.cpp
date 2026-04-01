@@ -590,7 +590,8 @@ struct Watch {
     int                      qty       = 0;
     int                      endingQty = 0;
     double                   maxSpend  = 0.0;
-    double                   spent     = 0.0;
+    // Single writer (WS thread) — atomic so pre-flight budget check needs no mutex.
+    std::atomic<double>      spent{0.0};
     std::string              name;
     std::vector<OrderRecord> orders;
     std::atomic<bool>        stop{false};
@@ -916,15 +917,12 @@ static void place_order(double price, bool at_circuit, double ltp,
     thread_local std::string tl_payload;
     thread_local std::string tl_body;
 
-    // Pre-flight budget check — prevents placing an order that would exceed maxSpend.
+    // Pre-flight budget check — lock-free: spent is atomic, single writer (WS thread).
     const int qty_pre = at_circuit ? watch->endingQty : watch->qty;
-    {
-        std::lock_guard<std::mutex> ll(watch->lat_mutex);
-        if (watch->spent + price * qty_pre > watch->maxSpend) {
-            watch_log(watch->id, "Budget cap — order suppressed", "warning");
-            watch->stop.store(true);
-            return;
-        }
+    if (watch->spent.load(std::memory_order_relaxed) + price * qty_pre > watch->maxSpend) {
+        watch_log(watch->id, "Budget cap — order suppressed", "warning");
+        watch->stop.store(true);
+        return;
     }
 
     // Payload assembly: 2 snprintfs + 7 appends of pre-built segments — nothing else.
@@ -961,6 +959,8 @@ static void place_order(double price, bool at_circuit, double ltp,
                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36");
                 watch->order_hdrs = curl_slist_append(watch->order_hdrs,
                     (std::string("Referer: ") + ATRAD_BASE + "/home?action=showHome&format=html").c_str());
+                // Re-apply HTTPHEADER with the new pointer after rebuild.
+                curl_easy_setopt(watch->order_curl, CURLOPT_HTTPHEADER, watch->order_hdrs);
                 watch->order_cookie_gen.store(cur_gen, std::memory_order_relaxed);
                 watch_log(watch->id, "order_hdrs rebuilt after ATRAD session change", "info");
             }
@@ -968,12 +968,10 @@ static void place_order(double price, bool at_circuit, double ltp,
 
         tl_body.clear();
 
-        // No curl_easy_reset() — permanent opts survive, HTTP/1.1 keep-alive reused.
-        curl_easy_setopt(watch->order_curl, CURLOPT_URL,           ATRAD_ORDER_URL);
-        curl_easy_setopt(watch->order_curl, CURLOPT_POST,          1L);
+        // URL, POST, HTTPHEADER are permanent opts — set once at cmd_add_watch / session rebuild.
+        // Only payload pointer/size and response buffer change per order.
         curl_easy_setopt(watch->order_curl, CURLOPT_POSTFIELDS,    tl_payload.c_str());
         curl_easy_setopt(watch->order_curl, CURLOPT_POSTFIELDSIZE, (long)tl_payload.size());
-        curl_easy_setopt(watch->order_curl, CURLOPT_HTTPHEADER,    watch->order_hdrs);
         curl_easy_setopt(watch->order_curl, CURLOPT_WRITEDATA,     &tl_body);
         CURLcode ce = curl_easy_perform(watch->order_curl);
         curl_easy_getinfo(watch->order_curl, CURLINFO_RESPONSE_CODE, &http_code);
@@ -1001,8 +999,9 @@ static void place_order(double price, bool at_circuit, double ltp,
         watch->api_rtt_us.push_back(rtt_us);
         if (success) {
             watch->orders.push_back({price, qty});
-            watch->spent += price * qty;
-            spent = watch->spent;
+            const double new_spent = watch->spent.load(std::memory_order_relaxed) + price * qty;
+            watch->spent.store(new_spent, std::memory_order_relaxed);
+            spent = new_spent;
         }
     }
 
@@ -1698,7 +1697,7 @@ static void print_totals() {
         std::lock_guard<std::mutex> lk(g_watches_mutex);
         for (auto& [wid, w] : g_watches) {
             std::lock_guard<std::mutex> ll(w->lat_mutex);
-            total_spent  += w->spent;
+            total_spent  += w->spent.load(std::memory_order_relaxed);
             total_budget += w->maxSpend;
         }
     }
@@ -1988,7 +1987,7 @@ static void cmd_list_watches() {
         if (name.size() > 18) name = name.substr(0, 18);
 
         double spent;
-        { std::lock_guard<std::mutex> ll(w->lat_mutex); spent = w->spent; }
+        spent = w->spent.load(std::memory_order_relaxed);
         std::ostringstream row;
         row << std::fixed << std::setprecision(1);
         row << "  " << BCY_ << std::left << std::setw(10) << wid << R_
@@ -2237,7 +2236,7 @@ static void cmd_fire(const std::string& sym) {
     // 4. Pre-flight budget check — same gate as place_order().
     {
         std::lock_guard<std::mutex> ll(watch->lat_mutex);
-        if (watch->spent + bid * qty > watch->maxSpend) {
+        if (watch->spent.load(std::memory_order_relaxed) + bid * qty > watch->maxSpend) {
             cprint(std::string(YL_) + "  Budget cap already reached — fire aborted." + R_);
             return;
         }
@@ -2303,8 +2302,9 @@ static void cmd_fire(const std::string& sym) {
             {
                 std::lock_guard<std::mutex> ll(watch->lat_mutex);
                 watch->orders.push_back({bid, qty});
-                watch->spent += bid * (double)qty;
-                spent = watch->spent;
+                const double new_spent = watch->spent.load(std::memory_order_relaxed) + bid * (double)qty;
+                watch->spent.store(new_spent, std::memory_order_relaxed);
+                spent = new_spent;
                 watch->first_order_done.store(true,        std::memory_order_relaxed);
                 watch->last_ltp.store(future_ltp,          std::memory_order_relaxed);
             }
